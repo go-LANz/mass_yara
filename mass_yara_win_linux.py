@@ -11,6 +11,7 @@ import ctypes
 
 # --- Configuration ---
 LOG_FILE = "yara_scan_results.jsonl"
+ERROR_LOG_FILE = "yara_compile_errors.log"
 MATCH_PREVIEW_LEN = 100
 
 def is_admin():
@@ -20,7 +21,6 @@ def is_admin():
         if current_os == "Windows":
             return ctypes.windll.shell32.IsUserAnAdmin() != 0
         else:
-            # Linux/Unix check
             return os.geteuid() == 0
     except Exception:
         return False
@@ -75,25 +75,57 @@ def log_hit(file_handle, scan_type, match, target_path, extra_metadata=None):
         file_handle.flush()
 
 def compile_rules(rule_dir):
+    """
+    Iteratively compiles rules. If one fails, it logs the error and continues.
+    Returns a compiled YARA rules object.
+    """
     if not os.path.isdir(rule_dir):
         print(f"[ERROR] Rule directory '{rule_dir}' not found.")
         sys.exit(1)
 
     print(f"[*] Compiling rules from: {rule_dir}")
-    rule_map = {}
-    for root, _, files in os.walk(rule_dir):
-        for file in files:
-            if file.lower().endswith(('.yara', '.yar')):
-                rule_map[file] = os.path.join(root, file)
+    
+    # Initialize the Compiler
+    compiler = yara.Compiler()
+    
+    valid_count = 0
+    failed_count = 0
+    
+    # Prepare the error log
+    with open(ERROR_LOG_FILE, "w", encoding="utf-8") as err_log:
+        err_log.write(f"--- YARA Compilation Error Log ({time.strftime('%Y-%m-%d %H:%M:%S')}) ---\n\n")
 
-    if not rule_map:
-        print("[ERROR] No .yara files found.")
+        for root, _, files in os.walk(rule_dir):
+            for file in files:
+                if file.lower().endswith(('.yara', '.yar')):
+                    full_path = os.path.join(root, file)
+                    try:
+                        # We use add_file so YARA handles reading the content
+                        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            # Namespace set to filename allows tracking which file a rule came from
+                            compiler.add_file(f, namespace=file)
+                        valid_count += 1
+                    except (yara.SyntaxError, yara.Error, Exception) as e:
+                        # Log the failure but do not stop
+                        failed_count += 1
+                        error_msg = f"[!] Failed: {file} | Error: {str(e)}"
+                        print(error_msg)
+                        err_log.write(f"{error_msg}\nPath: {full_path}\n{'-'*40}\n")
+
+    print(f"[*] Compilation finished. Valid: {valid_count}, Failed: {failed_count}")
+    
+    if failed_count > 0:
+        print(f"[*] check '{ERROR_LOG_FILE}' for details on failed rules.")
+
+    if valid_count == 0:
+        print("[CRITICAL] No valid rules were compiled. Exiting.")
         sys.exit(1)
 
     try:
-        return yara.compile(filepaths=rule_map)
-    except Exception as e:
-        print(f"[CRITICAL] Compilation Error: {e}")
+        # Build the final rules object
+        return compiler.build()
+    except yara.Error as e:
+        print(f"[CRITICAL] Final build failed (possibly undefined externals): {e}")
         sys.exit(1)
 
 def scan_file_system(rules, path, log_handle):
@@ -126,7 +158,6 @@ def scan_memory(rules, log_handle):
         print("[WARNING] Not running as Root/Admin. Visibility will be limited.")
 
     start_time = time.time()
-    # Iterate processes
     for proc in psutil.process_iter(['pid', 'name', 'exe', 'username']):
         try:
             pid = proc.info['pid']
@@ -148,7 +179,7 @@ def scan_memory(rules, log_handle):
     print(f"[*] Memory scan completed in {time.time() - start_time:.2f} seconds.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Mass YARA Scanner (Win/Linux)")
+    parser = argparse.ArgumentParser(description="Mass YARA Scanner (Fault Tolerant)")
     parser.add_argument('-r', '--rules', required=True, help="Directory containing .yara files")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('-p', '--path', help="Path to scan (File or Directory)")
@@ -157,12 +188,13 @@ def main():
     
     args = parser.parse_args()
     
-    # Platform check for sanity
     if platform.system() == "Darwin":
-        print("[!] Warning: This script is optimized for Win/Linux. Use the macOS specific version for better results.")
+        print("[!] Warning: Use the macOS specific version for better TCC handling on Macs.")
 
+    # 1. Compile (with fault tolerance)
     yara_rules = compile_rules(args.rules)
 
+    # 2. Scan
     try:
         with open(args.output, 'a', encoding='utf-8') as f:
             if args.memory:
