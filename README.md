@@ -39,25 +39,25 @@ pip install yara-python psutil colorama pyinstaller
 
 To deploy this on a target machine without installing Python, compile it into a standalone executable.
 
-> **Note:** The script `mass_yara_triage_v6.py` is universal. You compile the same script on each OS to get the native binary for that OS.
+> **Note:** The script `mass_yara.py` is universal. You compile the same script on each OS to get the native binary for that OS.
 
 **Windows:**
 *(Requires [Visual C++ Build Tools](https://www.google.com/search?q=https://visualstudio.microsoft.com/visual-cpp-build-tools/))*
 
 ```bash
-pyinstaller --onefile --clean --name "MassYara_Win" mass_yara_triage_v6.py
+pyinstaller --onefile --clean --name "MassYara_Win" mass_yara.py
 ```
 
 **Linux:**
 
 ```bash
-pyinstaller --onefile --clean --name "MassYara_Linux" mass_yara_triage_v6.py
+pyinstaller --onefile --clean --name "MassYara_Linux" mass_yara.py
 ```
 
 **macOS:**
 
 ```bash
-pyinstaller --onefile --clean --name "MassYara_Mac" mass_yara_triage_v6.py
+pyinstaller --onefile --clean --name "MassYara_Mac" mass_yara.py
 ```
 
 -----

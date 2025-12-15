@@ -1,0 +1,7 @@
+# Core Dependencies
+yara-python>=4.2.0
+psutil>=5.9.0
+colorama>=0.4.6
+
+# Build Tool (Optional: Only needed if compiling to binary)
+pyinstaller>=5.0
