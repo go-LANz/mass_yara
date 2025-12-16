@@ -1,23 +1,26 @@
 # Mass YARA Triage
 
-**Mass YARA Triage** is a robust, cross-platform hybrid forensic scanner designed for Digital Forensics and Incident Response (DFIR).
+**Mass YARA Triage** is a robust, cross-platformYARA scanner designed for Digital Forensics and Incident Response (DFIR).
 
-It solves the common limitation of the standard `yara` CLI by allowing you to **compile and run an entire directory of rules** simultaneously against **Disk or Memory**, without needing to manually merge rule files. It combines raw pattern matching with behavioral "Masquerade Checks" to detect advanced threats.
+A high-performance, cross-platform forensic triage tool designed for Incident Response. It performs Disk and Process Memory scanning using a pure YARA engine approach, robust logging, and smart noise reduction features.
+It solves the common limitation of the standard `yara` CLI by allowing you to **compile and run an entire directory of rules** simultaneously against **Disk or Memory**, without needing to manually merge rule files.
 
 > ✨ **Proudly developed by Vibe Coding.**
 > (We don't know why it works, but the vibes are immaculate.)
 
 ## ⚡ Key Features
 
+
   * **Directory Compilation:** Automatically compiles hundreds of `.yar` / `.yara` files from a folder into a single scanning engine.
-  * **Hybrid Engine:** Not just a YARA scanner. It includes behavioral checks (e.g., **Masquerade Check**) to detect system processes like `svchost.exe` running from unexpected paths.
-  * **Memory Scanning (Win/Linux):** Iterates through running processes and scans their memory (bypassing the need for manual PID injection). Includes a **RAM Limiter** to skip massive processes and prevent server crashes.
+  * **Pure YARA Engine:** Focused solely on deterministic content matching.
+  * **Memory Scanning (Win/Linux):** Iterates through running processes and scans their memory (bypassing the need for manual PID injection).
   * **Dual Output:**
       * **Operator UI:** Colorized, real-time terminal alerts (Red for Hits, Yellow for Suspicious).
       * **Forensic Reports:** Generates a structured `.jsonl` pipeline file AND a dark-mode `.html` report.
   * **Forensic Triage:** Automatically calculates **SHA256 hash** and file size for any disk hit. Supports **"Known Good"** hash lists to skip scanning safe files.
   * **Fast Mode:** Optional Allowlist mode to scan *only* executables, scripts, and config files for rapid triage.
   * **Cross-Platform:** Universal support for Windows, Linux, and macOS (Disk Only).
+  * **Resource Control:** `--low-priority` mode pins scanning to CPU 0 and drops process priority to IDLE to prevent server lag.
 
 -----
 
@@ -102,11 +105,27 @@ Provide a list of known-good SHA256 hashes. The tool will calculate hashes *befo
 MassYara_Win.exe -r ./rules -p C:\Windows --known-good known_good.txt
 ```
 
+## ⚙️ Command Line Arguments
+
+| Argument | Description |
+| :--- | :--- |
+| `-r`, `--rules` | **Required.** Directory containing `.yar` rule files. |
+| `-p`, `--path` | Path to scan on disk (File or Directory). |
+| `-m`, `--memory` | Enable Process Memory scanning. |
+| `--fast` | **Optimization.** Only scans specific extensions and stops on 1st match per file. |
+| `--low-priority` | **Safety.** Limits tool to CPU 0 and sets IDLE priority. |
+| `--known-good` | Path to a file containing SHA256 hashes to IGNORE. |
+| `--max-size` | Max file size in MB to scan (Default: 100MB). |
+| `--max-mem` | Max Process RAM in MB to scan (Default: 2048MB). |
+| `-o`, `--out-dir` | Output directory for logs (Default: Current Dir). |
+
 -----
 
-## 📄 Output Format (JSONL)
+## 📄 Output Format
 
-The tool generates a `scan.jsonl` file suitable for ingestion into SIEMs (Splunk, ELK) or timeline analysis tools.
+The tool generates a `scan.jsonl` file suitable for ingestion into SIEMs (Splunk, ELK) or timeline analysis tools, plus a analyst friendy `scan_report.html`
+
+### 1\. `scan.jsonl` (JSON Lines)
 
 **Example Disk Hit:**
 
@@ -142,17 +161,21 @@ The tool generates a `scan.jsonl` file suitable for ingestion into SIEMs (Splunk
 }
 ```
 
-**Example Masquerade Alert (No YARA match required):**
+### 2\. `scan_report.html` (Dashboard)
 
-```json
-{
-  "timestamp": "2025-12-15 12:03:00",
-  "level": "WARN",
-  "scan_type": "PROC_ANOMALY",
-  "rule": "Masquerade_Check",
-  "target": "MASQUERADE DETECTED: svchost.exe running from c:\\temp\\svchost.exe"
-}
-```
+A standalone HTML file containing:
+
+  * **Execution Metadata:** Hostname, Start/End time, Command used.
+  * **Metrics:** Rules loaded, Items scanned, Detection count, Duration.
+  * **Interactive Log Table:** Color-coded rows for Hits (Red), Suspicious Events (Orange), and Warnings (Yellow).
+  * **Noisy Rules Summary:** A list of rules that were squelched due to excessive hits.
+
+## 🛡️ Log Levels
+
+  * `[!] HIT` (Critical): A confirmed YARA match.
+  * `[?] SUS` (High): A security event, such as a blocked path traversal attempt.
+  * `[-] WARN` (Medium): An operational issue (File locked, Permission denied, Timeout).
+  * `[*] INFO` (Low): General status updates.
 
 -----
 
