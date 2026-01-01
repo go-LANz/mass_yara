@@ -1,28 +1,45 @@
-# Mass YARA Triage
 
-**Mass YARA Triage** is a robust, cross-platformYARA scanner designed for Digital Forensics and Incident Response (DFIR).
+```markdown
+# Mass YARA Scanner v50 (Multiprocessing Edition)
 
-A high-performance, cross-platform forensic triage tool designed for Incident Response. It performs Disk and Process Memory scanning using a pure YARA engine approach, robust logging, and smart noise reduction features.
+**Mass YARA Scanner** is a high-performance, multi-threaded, cross-platform forensic triage tool designed for Incident Response. It performs Disk and Process Memory scanning using a pure YARA engine approach, robust logging, and smart noise reduction features.
 It solves the common limitation of the standard `yara` CLI by allowing you to **compile and run an entire directory of rules** simultaneously against **Disk or Memory**, without needing to manually merge rule files.
 
+Unlike standard YARA wrappers, this tool is architected for **speed and stability** on live systems. It utilizes a **Producer/Consumer multiprocessing model** to saturate available CPU cores, smart "Drop Zone" prioritization to find malware faster, and robust safety mechanisms (Inode tracking, Memory limits) to prevent system instability during scans.
+
+
 > ✨ **Proudly developed by Vibe Coding.**
-> (We don't know why it works, but the vibes are immaculate.)
+> (Optimized for vibes, speed, and catch rates.)
 
 ## ⚡ Key Features
 
-
-  * **Directory Compilation:** Automatically compiles hundreds of `.yar` / `.yara` files from a folder into a single scanning engine.
+* **Multiprocessing Engine:** Automatically spawns worker processes (defaults to `CPU Count - 1`) to scan files in parallel. Includes a "Handshake" mechanism to prevent deadlocks.
   * **Pure YARA Engine:** Focused solely on deterministic content matching.
-  * **Memory Scanning (Win/Linux):** Iterates through running processes and scans their memory (bypassing the need for manual PID injection).
-  * **Dual Output:**
-      * **Operator UI:** Colorized, real-time terminal alerts (Red for Hits, Yellow for Suspicious).
-      * **Forensic Reports:** Generates a structured `.jsonl` pipeline file AND a dark-mode `.html` report.
-  * **Forensic Triage:** Automatically calculates **SHA256 hash** and file size for any disk hit. Supports **"Known Good"** hash lists to skip scanning safe files.
-  * **Fast Mode:** Optional Allowlist mode to scan *only* executables, scripts, and config files for rapid triage.
-  * **Cross-Platform:** Universal support for Windows, Linux, and macOS (Disk Only).
-  * **Resource Control:** `--low-priority` mode pins scanning to CPU 0 and drops process priority to IDLE to prevent server lag.
+* **"Drop Zone" Priority:** Scans high-risk paths first (e.g., `Downloads`, `Temp`, `AppData`, `/tmp`, `/dev/shm`) before crawling the rest of the disk.
+* **Memory Safety:** Explicit garbage collection and file size limits (`--max-size`) to prevent Out-Of-Memory (OOM) crashes on large datasets.
+* **Dual Reporting:**
+    * **JSONL:** Machine-readable logs for SIEM ingestion (Splunk/ELK).
+    * **HTML Dashboard:** A standalone, dark-mode report with JavaScript-powered statistics and noise filtering.
+* **Live System Safety:** `--low-priority` mode pins the tool to a single CPU core and drops process priority to `IDLE` to safely scan production servers.
 
------
+---
+
+##  🔧 Technical Deep Dive: Priority Drop Zones
+The "Drop Zone" logic is not just a hardcoded list of paths; it is a dynamic, scope-aware pre-fetch mechanism designed to maximize the probability of early detection.
+
+Wildcard Expansion: The scanner maintains a platform-specific map of high-risk patterns containing wildcards (e.g., C:\Users\*\Downloads on Windows or /home/*/.ssh on Linux). At runtime, these are expanded using glob to identify actual existing directories on the system.
+
+Strict Scope Enforcement (The "Containment" Check): To prevent "scope leakage," the scanner strictly enforces that a Drop Zone must be a child of the user-provided target path (-p).
+
+Scenario A: You scan -p C:\. The pattern C:\Users\*\Downloads expands to all user download folders. Since these are children of C:\, they are added to the Phase 1 priority queue.
+
+Scenario B: You scan -p C:\Users\Alice. The pattern C:\Users\*\Downloads might find C:\Users\Bob\Downloads. The scanner detects that Bob is outside the scope of Alice and silently discards that path.
+
+Result: You never scan files outside the directory tree you explicitly targeted, even if they are in the global priority list.
+
+Phase 2 Deduplication: Directories scanned in Phase 1 are added to a processed_dirs set (normalized absolute paths). When Phase 2 begins the general os.walk() of the target root, it checks every directory against this set. If a directory was already handled in Phase 1, the walker prunes that branch of the tree immediately, ensuring zero redundant I/O operations.
+
+---
 
 ## 🛠️ Installation
 
@@ -31,30 +48,32 @@ It solves the common limitation of the standard `yara` CLI by allowing you to **
 You need Python 3.8+ installed.
 
 ```bash
-# Windows / Linux
-pip install yara-python psutil colorama pyinstaller
+# Windows
+pip install yara-python psutil colorama
 
-# macOS (No psutil memory features used, but required for the script to load)
-pip install yara-python psutil colorama pyinstaller
+# Linux (Ensure libyara is installed first)
+sudo apt install libyara-dev
+pip install yara-python psutil colorama
+
 ```
 
 ### Compilation (Building the Binary)
 
 To deploy this on a target machine without installing Python, compile it into a standalone executable.
 
-> **Note:** The script `mass_yara.py` is universal. You compile the same script on each OS to get the native binary for that OS.
-
 **Windows:**
 *(Requires [Visual C++ Build Tools](https://www.google.com/search?q=https://visualstudio.microsoft.com/visual-cpp-build-tools/))*
 
 ```bash
-pyinstaller --onefile --clean --name "MassYara_Win" mass_yara.py
+pyinstaller --onefile --clean --name "MassYara_Win" mass_yara_multi_process.py
+
 ```
 
 **Linux:**
 
 ```bash
-pyinstaller --onefile --clean --name "MassYara_Linux" mass_yara.py
+pyinstaller --onefile --clean --name "MassYara_Linux" mass_yara_multi_process.py
+
 ```
 
 **macOS:**
@@ -63,112 +82,129 @@ pyinstaller --onefile --clean --name "MassYara_Linux" mass_yara.py
 pyinstaller --onefile --clean --name "MassYara_Mac" mass_yara.py
 ```
 
------
+---
 
 ## 🚀 Usage
 
-**Note:** Requires `Administrator` / `Root` privileges for Memory scanning. On macOS, "Full Disk Access" is recommended.
+**Note:** Requires `Administrator` (Windows) or `Root` (Linux/macOS) privileges.
 
-### 1\. The "Quick Triage" (Fast Mode)
+### 1. The "Quick Triage" (Fast Mode)
 
-Scans running processes and critical file extensions (`.exe`, `.dll`, `.ps1`, `.php`) on the disk.
-
-```bash
-# Windows
-MassYara_Win.exe -r ./rules -m -p C:\ --fast
-
-# Linux
-sudo ./MassYara_Linux -r ./rules -m -p / --fast
-```
-
-### 2\. The "Deep Forensic" Scan
-
-Scans Memory and **ALL** files on disk (except huge media files like `.iso`/`.mp4`).
+Scans high-risk directories first, then checks *only* executable/script extensions (`.exe`, `.dll`, `.ps1`, `.php`) on the rest of the disk. Stops on the first match **per file.**
 
 ```bash
-MassYara_Win.exe -r C:\YARA\rules -m -p C:\
+python mass_yara.py -r ./rules -p C:\ --fast --workers 16
+
 ```
 
-### 3\. Server Safety Mode (Database/Exchange Servers)
+### 2. The "Deep Forensic" Scan
 
-Scans memory but skips any process using more than 4GB of RAM to avoid performance impact.
+Scans Process Memory and **ALL** files on disk (except redundant media files like `.iso`/`.mp4`).
 
 ```bash
-MassYara_Win.exe -r ./rules -m --max-mem 4096
+python mass_yara.py -r /opt/yara-rules -m -p /
+
 ```
 
-### 4\. False Positive Reduction (Hash List)
+### 3. Production Server Safety Mode
 
-Provide a list of known-good SHA256 hashes. The tool will calculate hashes *before* YARA scanning and skip matches.
+Use this for Database or Exchange servers. It pins the scanner to **CPU 0**, sets process priority to **IDLE**, and limits memory usage.
 
 ```bash
-MassYara_Win.exe -r ./rules -p C:\Windows --known-good known_good.txt
+python mass_yara.py -r ./rules -m -p C:\ --low-priority --max-mem 4096
+
 ```
+
+### 4. False Positive Reduction (Hash List)
+
+Provide a list of known-good SHA256 hashes (CSV or Space-separated). The tool calculates the hash of a file *before* scanning; if it matches the list, the YARA scan is skipped.
+
+```bash
+python mass_yara.py -r ./rules -p C:\Windows --known-good known_good.txt
+
+```
+
+---
 
 ## ⚙️ Command Line Arguments
 
 | Argument | Description |
-| :--- | :--- |
-| `-r`, `--rules` | **Required.** Directory containing `.yar` rule files. |
-| `-p`, `--path` | Path to scan on disk (File or Directory). |
-| `-m`, `--memory` | Enable Process Memory scanning. |
+| --- | --- |
+| `-r`, `--rules` | **Required.** Directory containing `.yar` rule files (compiled automatically). |
+| `-p`, `--path` | Target directory or file to scan on disk. |
+| `-m`, `--memory` | Enable Process Memory scanning (Windows/Linux only). |
+| `--workers` | Number of parallel worker processes (Default: `CPU - 1`). |
 | `--fast` | **Optimization.** Only scans specific extensions and stops on 1st match per file. |
-| `--low-priority` | **Safety.** Limits tool to CPU 0 and sets IDLE priority. |
+| `--low-priority` | **Safety.** Overrides workers to **1**, pins to CPU 0, and sets IDLE priority. |
 | `--known-good` | Path to a file containing SHA256 hashes to IGNORE. |
 | `--max-size` | Max file size in MB to scan (Default: 100MB). |
 | `--max-mem` | Max Process RAM in MB to scan (Default: 2048MB). |
 | `-o`, `--out-dir` | Output directory for logs (Default: Current Dir). |
 
------
+---
 
 ## 📄 Output Format
 
-The tool generates a `scan.jsonl` file suitable for ingestion into SIEMs (Splunk, ELK) or timeline analysis tools, plus a analyst friendy `scan_report.html`
+The tool generates a timestamped `.jsonl` file and an `.html` report in the output directory.
 
-### 1\. `scan.jsonl` (JSON Lines)
+### 1. `scan_HOSTNAME_TIMESTAMP.jsonl`
 
-**Example Disk Hit:**
+Ideal for timeline analysis or SIEM ingestion.
 
 ```json
 {
-  "timestamp": "2025-12-15 12:01:22",
+  "timestamp": "2026-01-01 12:01:22",
   "level": "HIT",
   "scan_type": "DISK",
   "rule": "Webshell_PHP_Obfuscated",
   "target": "C:\\inetpub\\wwwroot\\images\\logo.php",
   "meta": {
     "size": 4096,
-    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "sha256": "e3b0c442... (hash)",
+    "iocs": { "ips": ["192.168.1.50"] }
   },
   "strings": [
-    {
-      "data": "eval(base64_decode($_POST['cmd']));"
-    }
+    { "id": "$cmd", "offset": 102, "data_preview": "eval(base64_decode..." }
   ]
 }
+
 ```
 
 **Example Memory Hit:**
 
 ```json
 {
-  "timestamp": "2025-12-15 12:02:10",
+  "timestamp": "2025-12-15 12:05:45",
   "level": "HIT",
   "scan_type": "MEMORY",
-  "rule": "Mimikatz_Memory_Pattern",
-  "target": "lsass.exe (744)",
-  "meta": {}
+  "rule": "Mimikatz_Credential_Dump",
+  "target": "lsass.exe [PID:744]",
+  "meta": {
+    "ppid": 620,
+    "username": "NT AUTHORITY\\SYSTEM",
+    "cmdline": "C:\\Windows\\system32\\lsass.exe",
+    "parent_chain": [
+      { "pid": 620, "name": "wininit.exe" }
+    ],
+    "started": "2025-12-15 09:00:00"
+  },
+  "strings": [
+    {
+      "id": "$sekurlsa",
+      "offset": 1048576,
+      "data_preview": "sekurlsa::logonpasswords"
+    }
+  ]
 }
 ```
 
-### 2\. `scan_report.html` (Dashboard)
+### 2. `scan_HOSTNAME_TIMESTAMP.html`
 
-A standalone HTML file containing:
+A visual dashboard containing:
 
-  * **Execution Metadata:** Hostname, Start/End time, Command used.
-  * **Metrics:** Rules loaded, Items scanned, Detection count, Duration.
-  * **Interactive Log Table:** Color-coded rows for Hits (Red), Suspicious Events (Orange), and Warnings (Yellow).
-  * **Noisy Rules Summary:** A list of rules that were squelched due to excessive hits.
+* **Scan Statistics:** Duration, Files Scanned per second, Top hitting extensions.
+* **Performance Warnings:** Alerts if specific rules are "noisy" (generating too many hits) and slowing down the scan.
+* **Detail View:** Color-coded table of hits.
 
 ## 🛡️ Log Levels
 
@@ -177,18 +213,19 @@ A standalone HTML file containing:
   * `[-] WARN` (Medium): An operational issue (File locked, Permission denied, Timeout).
   * `[*] INFO` (Low): General status updates.
 
------
+---
 
 ## ⚠️ Known Limitations
 
-1.  **macOS Memory:** The macOS version does not support memory scanning due to SIP (System Integrity Protection) and `task_for_pid` restrictions. The `-m` flag is automatically ignored on macOS to prevent errors.
-2.  **Linux Ptrace:** On hardened Linux kernels, you may need to allow `ptrace` for memory scanning:
-    `echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope`
-3.  **Cross-Platform Rules:** While you can run Windows rules on Linux (and vice versa), module-specific rules (like `pe` or `elf`) will simply return `undefined` on the wrong OS. This is safe but may slightly impact performance.
-4.  **AV Detection:** As with any tool that iterates process memory, EDRs may flag the compiled binary as suspicious. Whitelisting the hash is recommended for deployment.
+1. **macOS Memory:** Memory scanning is disabled on macOS due to SIP (System Integrity Protection) restrictions.
+2. **Linux Ptrace:** On hardened Linux kernels (e.g., Ubuntu/Debian), you may need to temporarily allow `ptrace` for memory scanning:
+`echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope`
+3. **Symlinks:** The tool tracks Inodes to prevent infinite loops, but will alert (`[?] SUS`) if a symlink points to a sensitive target like `/etc/shadow` or `C:\Windows\System32`.
 
------
+## License
 
-## Disclaimer
+**MIT License** - Free for use in commercial, private, and educational settings.
 
-This tool is intended for legal security analysis, digital forensics, and incident response. The author (and the Vibe Coding team) is not responsible for misuse or damage caused by this software. Use responsibly.
+```
+
+```
