@@ -1,6 +1,6 @@
 
 ```markdown
-# Mass YARA Scanner v50 (Multiprocessing Edition)
+# Mass YARA Scanner (Multiprocessing Edition)
 
 **Mass YARA Scanner** is a high-performance, multi-threaded, cross-platform forensic triage tool designed for Incident Response. It performs Disk and Process Memory scanning using a pure YARA engine approach, robust logging, and smart noise reduction features.
 It solves the common limitation of the standard `yara` CLI by allowing you to **compile and run an entire directory of rules** simultaneously against **Disk or Memory**, without needing to manually merge rule files.

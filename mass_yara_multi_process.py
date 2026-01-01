@@ -1,5 +1,5 @@
 """
-Mass YARA Scanner v49 (Optimized & Hardened)
+Mass YARA Scanner
 ============================================
 
 A high-performance, multi-threaded, OS-agnostic YARA scanner designed for 
@@ -784,7 +784,7 @@ def main():
         print(f"{Fore.RED}[CRITICAL] This tool requires Administrator/Root privileges.{Style.RESET_ALL}")
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description="Mass YARA Scanner v49", formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(description="Mass YARA Scanner", formatter_class=argparse.RawTextHelpFormatter)
     input_group = parser.add_argument_group('Input')
     input_group.add_argument('-r', '--rules', required=True, metavar='DIR', help="Directory containing .yara rule files")
     
