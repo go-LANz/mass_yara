@@ -1,6 +1,6 @@
 """
-Mass YARA Scanner
-============================================
+Mass YARA Scanner v51 (Verbose & No-Color)
+==========================================
 
 A high-performance, multi-threaded, OS-agnostic YARA scanner designed for 
 Digital Forensics and Incident Response (DFIR) engagements.
@@ -26,7 +26,7 @@ Arguments:
     --low-priority : Run on 1 core with idle priority (for live servers).
 
 Dependencies:
-    pip install yara-python psutil colorama
+    pip install yara-python psutil
     *Note: On Linux, ensure libyara is installed (e.g., sudo apt install libyara-dev) before installing yara-python.*
 
 Log Format (JSONL):
@@ -48,7 +48,7 @@ License:
     MIT License - Free for use in commercial, private, and educational settings.
 
 Author: Golan (DFIR Lead) & Gemini
-Version: 49.0
+Version: 51.0
 """
 
 import os
@@ -71,10 +71,6 @@ import glob
 import gc
 from collections import defaultdict
 from functools import partial
-from colorama import init, Fore, Style
-
-# Initialize colorama for cross-platform colored output
-init()
 
 # --- Configuration & Constants ---
 
@@ -256,9 +252,9 @@ def set_low_priority():
             os.nice(19)
         if hasattr(p, "cpu_affinity"):
             p.cpu_affinity([0]) # Pin to CPU 0
-        print(f"{Fore.YELLOW}[!] Low Priority Mode Enabled{Style.RESET_ALL}")
+        print(f"[!] Low Priority Mode Enabled")
     except Exception as e:
-        print(f"{Fore.RED}[!] Failed to set low priority: {e}{Style.RESET_ALL}")
+        print(f"[!] Failed to set low priority: {e}")
 
 def is_safe_path(filepath, base_path):
     """
@@ -555,7 +551,7 @@ class DualLogger:
         json_path = os.path.join(out_dir, json_name)
         html_path = os.path.join(out_dir, html_name)
         
-        print(f"{Fore.GREEN}[*] Log File: {json_name}{Style.RESET_ALL}")
+        print(f"[*] Log File: {json_name}")
         
         self.json_file = open(json_path, 'a', encoding='utf-8')
         self.html_file = open(html_path, 'w', encoding='utf-8')
@@ -625,13 +621,13 @@ class DualLogger:
                 self.stats['errors'] += 1
 
         if level == "HIT" and not suppress_ui:
-            term_color = Fore.RED; html_class = "hit"; prefix = "[!] HIT"
+            html_class = "hit"; prefix = "[!] HIT"
         elif level == "SUS":
-            term_color = Fore.LIGHTRED_EX; html_class = "sus"; prefix = "[?] SUS"
+            html_class = "sus"; prefix = "[?] SUS"
         elif level == "WARN":
-            term_color = Fore.YELLOW; html_class = "warn"; prefix = "[-] WARN"
+            html_class = "warn"; prefix = "[-] WARN"
         else:
-            term_color = Fore.GREEN; html_class = "info"; prefix = "[*] INFO"
+            html_class = "info"; prefix = "[*] INFO"
 
         entry = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), 
@@ -646,10 +642,10 @@ class DualLogger:
         self.json_file.write(json.dumps(entry) + "\n")
 
         if not suppress_ui:
-            # \033[K clears the line to prevent overlap with the progress bar
+            # Clear line if terminal supports it
             sys.stdout.write("\033[K")
-            rule_part = f" | {Fore.MAGENTA}{display_rule}{Style.RESET_ALL}" if rule_name else ""
-            print(f"{term_color}{prefix}{Style.RESET_ALL} | {ts} | {scan_type}{rule_part} | {target}")
+            rule_part = f" | {display_rule}" if rule_name else ""
+            print(f"{prefix} | {ts} | {scan_type}{rule_part} | {target}")
             
             # --- SECURITY FIX: Explicit quoting for HTML ---
             safe_target = html.escape(str(target), quote=True)
@@ -716,7 +712,7 @@ def compile_rules_to_file(rule_dir, logger):
     Preserves namespaces (filenames) for attribution.
     Saves to a temporary file for easy loading by workers.
     """
-    print(f"{Fore.CYAN}[*] Compiling rules from: {rule_dir}{Style.RESET_ALL}")
+    print(f"[*] Compiling rules from: {rule_dir}")
     sources = {}
     valid_count = 0
     
@@ -740,7 +736,7 @@ def compile_rules_to_file(rule_dir, logger):
                     logger.log("WARN", "COMPILATION_ERROR", "READ_FAIL", f"{file}: {e}")
 
     if not sources:
-        print(f"{Fore.RED}[!] No valid rules found.{Style.RESET_ALL}")
+        print(f"[!] No valid rules found.")
         sys.exit(1)
 
     try:
@@ -748,7 +744,7 @@ def compile_rules_to_file(rule_dir, logger):
         fd, temp_path = tempfile.mkstemp(prefix="mass_yara_", suffix=".compiled")
         os.close(fd)
         compiled_rules.save(temp_path)
-        print(f"{Fore.CYAN}[*] Rules compiled: {valid_count}. Saved to temp.{Style.RESET_ALL}")
+        print(f"[*] Rules compiled: {valid_count}. Saved to temp.")
         return compiled_rules, temp_path, valid_count
     except Exception as e:
         logger.log("HIT", "CRITICAL_FAILURE", "LINKER_ERROR", str(e))
@@ -781,7 +777,7 @@ def get_proc_name(proc):
 # --- MAIN ENTRY POINT ---
 def main():
     if not is_admin():
-        print(f"{Fore.RED}[CRITICAL] This tool requires Administrator/Root privileges.{Style.RESET_ALL}")
+        print(f"[CRITICAL] This tool requires Administrator/Root privileges.")
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description="Mass YARA Scanner", formatter_class=argparse.RawTextHelpFormatter)
@@ -828,20 +824,35 @@ def main():
         if args.memory:
             logger.start_phase("Memory")
             current_os = platform.system()
+            my_pid = os.getpid()  # Capture our own PID
+            
+            try:
+                my_parent = psutil.Process(my_pid).ppid()
+            except: my_parent = None
+
             if current_os == "Darwin":
-                print(f"{Fore.YELLOW}[!] INFO: MacOS memory scan not supported. Ignoring.{Style.RESET_ALL}")
+                print(f"[!] INFO: MacOS memory scan not supported. Ignoring.")
             else:
-                print(f"{Fore.CYAN}[*] Starting Memory Scan (Main Process)...{Style.RESET_ALL}")
+                print(f"[*] Starting Memory Scan (Main Process)...")
                 max_mem_bytes = args.max_mem * 1024 * 1024
                 attrs = ['pid', 'name', 'exe', 'cmdline', 'cwd', 'username', 'create_time', 'ppid', 'memory_info']
 
                 for proc in psutil.process_iter(attrs):
                     try:
                         info = proc.info
+                        
+                        # [FIXED] SELF-EXCLUSION
+                        # Skip our own PID and Parent (Bootloader) to prevent false positives
+                        if info['pid'] == my_pid or info['pid'] == my_parent: continue
+                        
                         if current_os == "Windows" and info['pid'] == 0: continue 
                         
+                        # Capture name early for logging
+                        p_name = info.get('name', 'Unknown')
+                        
                         if info['memory_info'] and info['memory_info'].rss > max_mem_bytes:
-                             logger.log("WARN", "MEMORY_SKIP", "SIZE_LIMIT", f"PID {info['pid']} too large")
+                             # [FIXED] Added Process Name to Warning
+                             logger.log("WARN", "MEMORY_SKIP", "SIZE_LIMIT", f"{p_name} [PID:{info['pid']}] too large")
                              continue
                         
                         logger.increment_scanned()
@@ -862,10 +873,9 @@ def main():
                         }
 
                         matches = main_rules.match(pid=info['pid'], timeout=DEFAULT_TIMEOUT, fast=args.fast)
-                        proc_name = info.get('name') or "Unknown"
                         
                         for m in matches:
-                            target_str = f"{proc_name} [PID:{info['pid']}]"
+                            target_str = f"{p_name} [PID:{info['pid']}]"
                             strs = extract_strings_modern(m)
                             iocs = extract_iocs(strs)
                             if iocs: proc_meta['iocs'] = iocs
@@ -873,7 +883,10 @@ def main():
                             
                     except (psutil.NoSuchProcess, psutil.AccessDenied): continue
                     except Exception as e: 
-                        logger.log("WARN", "MEMORY_ERR", "FAIL", f"PID {proc.info.get('pid', '?')} error: {str(e)}")
+                        # [FIXED] Ensure Name is logged in Error
+                        err_pid = info.get('pid', '?')
+                        err_name = info.get('name', 'Unknown')
+                        logger.log("WARN", "MEMORY_ERR", "FAIL", f"{err_name} [PID:{err_pid}] error: {str(e)}")
             logger.end_phase("Memory")
 
         # --- DISK SCAN ---
@@ -883,7 +896,7 @@ def main():
             # to call abspath() inside the tight loop below.
             args.path = os.path.abspath(args.path)
             
-            print(f"{Fore.CYAN}[*] Scanning Disk: {args.path}{Style.RESET_ALL}")
+            print(f"[*] Scanning Disk: {args.path}")
             
             # Wrapper for safety and logic encapsulation
             def safe_file_generator():
@@ -898,7 +911,7 @@ def main():
                     # PHASE 1: Priority Drop Zones
                     # Scan likely malware locations first to get quick wins
                     if priority_list:
-                        print(f"{Fore.MAGENTA}[*] Phase 1: Scanning {len(priority_list)} Priority Targets...{Style.RESET_ALL}")
+                        print(f"[*] Phase 1: Scanning {len(priority_list)} Priority Targets...")
                         for p_root in priority_list:
                             # Normalize paths once for performance
                             norm_p_root = os.path.normcase(os.path.abspath(p_root))
@@ -918,8 +931,7 @@ def main():
                     
                     # PHASE 2: General Scan
                     # Scan whatever is left, skipping what we already covered in Phase 1
-                    print(f"{Fore.CYAN}[*] Phase 2: Scanning remaining files in {args.path}...{Style.RESET_ALL}")
-                    
+                    print(f"[*] Phase 2: Scanning remaining files in {args.path}...")
                     for root, dirs, files in os.walk(args.path):
                         # Optimization: args.path was forced absolute above, so root is absolute.
                         # We can skip os.path.abspath() here for speed.
@@ -942,7 +954,7 @@ def main():
                             if is_safe_path(full_path, args.path):
                                 yield (full_path, worker_config)
                 except Exception as e:
-                    print(f"{Fore.RED}[!] Generator Error: {e}{Style.RESET_ALL}")
+                    print(f"[!] Generator Error: {e}")
                     return
 
             # Initialize Queue for Worker Handshake
@@ -950,9 +962,9 @@ def main():
             manager = multiprocessing.Manager()
             status_queue = manager.Queue()
             
-            print(f"{Fore.CYAN}[*] Initializing {args.workers} workers...{Style.RESET_ALL}")
+            print(f"[*] Initializing {args.workers} workers...")
             
-            PROG_FMT = f"\r{Fore.CYAN}[*] Progress: {{}} files processed...{Style.RESET_ALL}"
+            PROG_FMT = "\r[*] Progress: {} files processed..."
 
             # Start the Worker Pool
             with multiprocessing.Pool(processes=args.workers, initializer=init_worker, initargs=(temp_rules_path, args.known_good, status_queue)) as pool:
@@ -965,12 +977,12 @@ def main():
                         if msg == "OK":
                             active_workers += 1
                         else:
-                            print(f"{Fore.RED}[!] Worker Init Failed: {msg}{Style.RESET_ALL}")
+                            print(f"[!] Worker Init Failed: {msg}")
                     except:
-                        print(f"{Fore.RED}[!] Worker Init Timeout{Style.RESET_ALL}")
+                        print(f"[!] Worker Init Timeout")
                 
                 if active_workers < args.workers:
-                    print(f"{Fore.RED}[CRITICAL] Only {active_workers}/{args.workers} started. Aborting to prevent deadlock.{Style.RESET_ALL}")
+                    print(f"[CRITICAL] Only {active_workers}/{args.workers} started. Aborting to prevent deadlock.")
                     return
 
                 chunk_size = max(20, args.workers * 5)
@@ -996,7 +1008,7 @@ def main():
                             logger.log(w[0], w[1], None, w[3], meta={"msg": w[2]})
                             
                 except KeyboardInterrupt:
-                    print(f"\n{Fore.YELLOW}[!] Caught Interrupt. Stopping Workers...{Style.RESET_ALL}")
+                    print(f"\n[!] Caught Interrupt. Stopping Workers...")
                 
                 logger.end_phase("Disk")
     
@@ -1009,12 +1021,12 @@ def main():
         
         logger.close()
         
-        print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}[✓] Scan Complete{Style.RESET_ALL}")
+        print(f"\n{'='*60}")
+        print(f"[+] Scan Complete")
         print(f"  Files Scanned: {logger.stats['scanned']}")
-        print(f"  Detections:    {Fore.RED if logger.stats['hits'] > 0 else Fore.GREEN}{logger.stats['hits']}{Style.RESET_ALL}")
+        print(f"  Detections:    {logger.stats['hits']}")
         print(f"  Errors:        {logger.stats['errors']}")
-        print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+        print(f"{'='*60}")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
