@@ -1,8 +1,8 @@
 """
-Mass YARA Scanner v51 (Verbose & No-Color)
-==========================================
+Mass YARA Scanner v52 (Performance & Robustness Update)
+=======================================================
 
-A high-performance, multi-threaded, OS-agnostic YARA scanner designed for 
+A high-performance, multi-threaded, OS-agnostic YARA scanner designed for
 Digital Forensics and Incident Response (DFIR) engagements.
 
 Features:
@@ -12,6 +12,8 @@ Features:
     - **Resilience:** Handles locked files, permission errors, and symlink loops gracefully.
     - **Dual Logging:** Produces both JSONL (for ingestion) and HTML (for reporting).
     - **Worker Handshake:** Prevents deadlocks by verifying worker initialization.
+    - **Memory-Mapped I/O:** Uses mmap for large files to reduce memory pressure.
+    - **Fast Directory Traversal:** Uses os.scandir() for faster filesystem enumeration.
 
 Usage:
     python mass_yara.py -r /path/to/rules -p /path/to/scan
@@ -24,6 +26,7 @@ Arguments:
     --fast         : Fast Mode (Scan specific extensions, stop on first match).
     --max-size     : Skip files larger than X MB (Default: 100).
     --low-priority : Run on 1 core with idle priority (for live servers).
+    --chunk-size   : Worker chunk size for task distribution (Default: auto).
 
 Dependencies:
     pip install yara-python psutil
@@ -48,7 +51,7 @@ License:
     MIT License - Free for use in commercial, private, and educational settings.
 
 Author: Golan (DFIR Lead) & Gemini
-Version: 51.0
+Version: 52.0
 """
 
 import os
@@ -69,8 +72,10 @@ import re
 import errno
 import glob
 import gc
+import mmap
 from collections import defaultdict
 from functools import partial
+from typing import Dict, List, Set, Tuple, Optional, Generator, Any
 
 # --- Configuration & Constants ---
 
@@ -79,7 +84,38 @@ DEFAULT_MAX_MEM_MB = 2048
 DEFAULT_TIMEOUT = 60
 NOISY_RULE_THRESHOLD = 50
 DEFAULT_WORKERS = max(1, multiprocessing.cpu_count() - 1)
-PROGRESS_INTERVAL = 10000 
+PROGRESS_INTERVAL = 10000
+
+# --- Performance Tuning Constants ---
+# Maximum number of known-good hashes to load (prevents OOM on huge hash files)
+MAX_KNOWN_GOOD_HASHES = 10_000_000  # 10 million hashes (~640MB memory)
+# Threshold for using memory-mapped I/O instead of read() (reduces memory pressure)
+MMAP_THRESHOLD_BYTES = 10 * 1024 * 1024  # 10MB
+# Threshold for forcing garbage collection after processing large files
+GC_THRESHOLD_BYTES = 50 * 1024 * 1024  # 50MB
+# Base timeout for worker initialization (scales with rule count)
+WORKER_INIT_BASE_TIMEOUT = 30  # seconds
+# Additional timeout per rule during worker initialization
+WORKER_INIT_TIMEOUT_PER_RULE = 0.01  # 10ms per rule (5000 rules = +50s)
+# Default chunk size multiplier for worker task distribution
+DEFAULT_CHUNK_MULTIPLIER = 10
+
+# --- Drop Zone Priority Weights ---
+# Higher weight = scanned earlier in Phase 1 (most likely malware locations first)
+DROP_ZONE_WEIGHTS: Dict[str, int] = {
+    "temp": 100,       # Temp directories - highest priority
+    "tmp": 100,
+    "downloads": 90,   # User downloads
+    "desktop": 80,     # Desktop shortcuts/droppers
+    "appdata": 70,     # Windows AppData
+    "roaming": 70,
+    "programdata": 60,
+    "public": 50,
+    "documents": 40,
+    ".local": 40,      # Linux user data
+    ".config": 40,
+    "library": 30,     # macOS Library
+} 
 
 # Suppress YARA warnings about "too many matches" to keep console clean.
 # This often happens with poorly written rules on large files.
@@ -227,7 +263,7 @@ HTML_HEADER = """
 
 # --- Helpers ---
 
-def is_admin():
+def is_admin() -> bool:
     """
     Checks for Administrator (Windows) or Root (Linux/Mac) privileges.
     Required because YARA often needs to read files owned by other users.
@@ -237,7 +273,9 @@ def is_admin():
             return ctypes.windll.shell32.IsUserAnAdmin() != 0
         else:
             return os.geteuid() == 0
-    except: return False
+    except (AttributeError, OSError) as e:
+        sys.stderr.write(f"[DEBUG] is_admin check failed: {e}\n")
+        return False
 
 def set_low_priority():
     """ 
@@ -256,7 +294,7 @@ def set_low_priority():
     except Exception as e:
         print(f"[!] Failed to set low priority: {e}")
 
-def is_safe_path(filepath, base_path):
+def is_safe_path(filepath: str, base_path: str) -> bool:
     """
     Validates that 'filepath' is strictly inside 'base_path'.
     Prevents path traversal attacks and symlink escapes (e.g. scanning / via a link).
@@ -266,32 +304,38 @@ def is_safe_path(filepath, base_path):
         real_base = os.path.realpath(base_path)
         real_path = os.path.normcase(real_path)
         real_base = os.path.normcase(real_base)
-        
+
         # Ensure base path ends with a separator for correct prefix matching
         if not real_base.endswith(os.sep):
             real_base += os.sep
-            
-        return real_path.startswith(real_base) or real_path == real_base.rstrip(os.sep)
-    except: return False
 
-def get_buffer_hash(data):
+        return real_path.startswith(real_base) or real_path == real_base.rstrip(os.sep)
+    except (OSError, ValueError) as e:
+        # OSError: permission denied, broken symlink, etc.
+        # ValueError: paths on different drives (Windows)
+        return False
+
+def get_buffer_hash(data: bytes) -> Optional[str]:
     """ Returns SHA256 hex digest of a byte buffer. Used for known-good comparisons. """
     try:
         return hashlib.sha256(data).hexdigest()
-    except: return None
+    except (TypeError, ValueError) as e:
+        sys.stderr.write(f"[DEBUG] Hash calculation failed: {e}\n")
+        return None
 
-def validate_positive_int(value):
+def validate_positive_int(value: str) -> int:
     """ Argparse validator for positive integers. """
     try:
         ivalue = int(value)
-        if ivalue <= 0: raise ValueError
+        if ivalue <= 0:
+            raise ValueError
         return ivalue
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value} is not a valid positive integer")
 
-def should_exclude_path(root_path, current_os):
-    """ 
-    Checks if path is in the platform-specific exclusion list (e.g. /proc). 
+def should_exclude_path(root_path: str, current_os: str) -> bool:
+    """
+    Checks if path is in the platform-specific exclusion list (e.g. /proc).
     Prevents scanning virtual filesystems that can cause hangs.
     """
     excludes = PLATFORM_EXCLUDES.get(current_os, [])
@@ -300,69 +344,96 @@ def should_exclude_path(root_path, current_os):
         for ex in excludes:
             if norm_root == ex or norm_root.startswith(ex + os.sep):
                 return True
-    except OSError: pass
+    except OSError:
+        pass
     return False
 
-def get_priority_paths(target_root):
+def get_priority_paths(target_root: str) -> List[str]:
     """
     Calculates the 'Drop Zone' paths for Phase 1 scanning.
     1. Expands wildcards (e.g., C:\\Users\\*\\Downloads) using glob.
     2. Enforces STRICT scope: Expanded path must be inside target_root.
+    3. Sorts by priority weight (Temp > Downloads > Desktop > etc.)
     """
     sys_plat = platform.system()
     raw_patterns = PRIORITY_MAP.get(sys_plat, [])
-    
+
     target_abs = os.path.normcase(os.path.abspath(target_root))
     # Ensure target ends with separator for strict prefix matching
     target_abs_strict = target_abs if target_abs.endswith(os.sep) else target_abs + os.sep
-        
-    valid_paths = []
-    
+
+    # Collect paths with their priority weights
+    weighted_paths: List[Tuple[int, str]] = []
+
     for pattern in raw_patterns:
         try:
+            # Calculate weight based on pattern keywords
+            pattern_lower = pattern.lower()
+            weight = 0
+            for keyword, w in DROP_ZONE_WEIGHTS.items():
+                if keyword in pattern_lower:
+                    weight = max(weight, w)
+                    break
+            if weight == 0:
+                weight = 25  # Default weight for unmatched patterns
+
             # Handle glob expansion; may fail on strict permissions
             expanded = glob.glob(pattern)
             for p in expanded:
                 try:
                     p_abs = os.path.normcase(os.path.abspath(p))
-                    # Enforce strict scope: Do not allow leakage outside the target (e.g., matching UserBackup when targeting Users)
+                    # Enforce strict scope: Do not allow leakage outside the target
                     if p_abs.startswith(target_abs_strict) or p_abs == target_abs:
-                        valid_paths.append(p_abs)
-                except: pass
-        except Exception: pass
-            
-    # Sort by length to process most specific paths first
-    return sorted(list(set(valid_paths)), key=len)
+                        weighted_paths.append((weight, p_abs))
+                except (OSError, ValueError):
+                    pass
+        except OSError:
+            pass
 
-def get_parent_chain(proc, max_depth=4):
-    """ 
-    Recurses up the process tree to find parent PIDs and names. 
+    # Remove duplicates while preserving highest weight for each path
+    path_weights: Dict[str, int] = {}
+    for weight, path in weighted_paths:
+        if path not in path_weights or weight > path_weights[path]:
+            path_weights[path] = weight
+
+    # Sort by weight (descending), then by path length (ascending for specificity)
+    sorted_paths = sorted(path_weights.items(), key=lambda x: (-x[1], len(x[0])))
+    return [path for weight, path in sorted_paths]
+
+def get_parent_chain(proc: psutil.Process, max_depth: int = 4) -> List[Dict[str, Any]]:
+    """
+    Recurses up the process tree to find parent PIDs and names.
     Crucial for identifying malware execution chains (e.g., cmd.exe -> powershell.exe).
     """
-    chain = []
+    chain: List[Dict[str, Any]] = []
     curr = proc
     for _ in range(max_depth):
         try:
-            if not curr or curr.pid == 0: break
+            if not curr or curr.pid == 0:
+                break
             chain.append({
                 "pid": curr.pid,
                 "name": curr.name() if hasattr(curr, 'name') else "Unknown",
                 "exe": curr.exe() if hasattr(curr, 'exe') else None
             })
             parent = curr.parent()
-            if not parent: break
+            if not parent:
+                break
             curr = parent
-        except (psutil.NoSuchProcess, psutil.AccessDenied): break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            break
     return chain
 
-def extract_iocs(strings_list):
-    """ 
+def extract_iocs(strings_list: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """
     Extracts IPs, URLs, and Emails from YARA string matches via Regex.
     Returns a dictionary of found IOCs to add to the JSON logs.
     """
-    if not strings_list: return {}
-    combined = " ".join([s.get('data_full', '') for s in strings_list])
-    
+    if not strings_list:
+        return {}
+    # Performance: Use generator expression instead of list comprehension (avoids intermediate list)
+    combined = " ".join(s.get('data_full', '') for s in strings_list)
+
     iocs = {
         "ips": list(set(IOC_IP_REGEX.findall(combined))),
         "urls": list(set(IOC_URL_REGEX.findall(combined))),
@@ -372,28 +443,43 @@ def extract_iocs(strings_list):
 
 # --- WORKER FUNCTIONS (Multiprocessing) ---
 
-def load_known_good_worker(path):
-    """ 
-    Loads known-good hash list into a set for O(1) lookups inside the worker. 
-    Supports both CSV (hash,filename) and space-separated (hash filename) formats.
+def load_known_good_worker(path: Optional[str], max_hashes: int = MAX_KNOWN_GOOD_HASHES) -> Set[str]:
     """
-    hashes = set()
+    Loads known-good hash list into a set for O(1) lookups inside the worker.
+    Supports both CSV (hash,filename) and space-separated (hash filename) formats.
+
+    Args:
+        path: Path to the hash file
+        max_hashes: Maximum number of hashes to load (prevents OOM on huge files)
+
+    Returns:
+        Set of lowercase SHA256 hashes
+    """
+    hashes: Set[str] = set()
     if path and os.path.exists(path):
         try:
             with open(path, 'r') as f:
-                for line in f:
-                    # Robustness: Replace comma with space to handle both CSV and 
+                for i, line in enumerate(f):
+                    # Safety: Limit number of hashes to prevent OOM
+                    if i >= max_hashes:
+                        sys.stderr.write(f"[!] Warning: Truncated known-good list at {max_hashes:,} entries\n")
+                        break
+
+                    # Robustness: Replace comma with space to handle both CSV and
                     # standard 'sha256sum' output formats cleanly.
                     line = line.replace(',', ' ')
                     parts = line.strip().split()
-                    if not parts: continue
-                    
+                    if not parts:
+                        continue
+
                     h = parts[0].strip().lower()
-                    if len(h) == 64: hashes.add(h)
-        except Exception: pass
+                    if len(h) == 64:
+                        hashes.add(h)
+        except (IOError, OSError) as e:
+            sys.stderr.write(f"[!] Warning: Failed to load known-good hashes: {e}\n")
     return hashes
 
-def init_worker(compiled_rules_path, known_good_path, status_queue):
+def init_worker(compiled_rules_path: str, known_good_path: Optional[str], status_queue: Any) -> None:
     """
     Initializes a worker process.
     1. Loads compiled YARA rules from temp file (fastest method).
@@ -405,12 +491,12 @@ def init_worker(compiled_rules_path, known_good_path, status_queue):
         WORKER_RULES = yara.load(compiled_rules_path)
         if known_good_path:
             WORKER_HASHES = load_known_good_worker(known_good_path)
-        
+
         # Signal Success to Main Process. This prevents the "deadlock" scenario where
         # the main process starts sending files before workers are ready.
         if status_queue:
             status_queue.put("OK")
-            
+
     except Exception as e:
         # Signal Failure
         sys.stderr.write(f"FATAL: Worker init failed: {e}\n")
@@ -418,7 +504,7 @@ def init_worker(compiled_rules_path, known_good_path, status_queue):
             status_queue.put(f"FAIL: {str(e)}")
         sys.exit(1)
 
-def scan_file_worker(args):
+def scan_file_worker(args: Tuple[str, Dict[str, Any]]) -> Dict[str, Any]:
     """
     The main scanning logic running inside each worker process.
     Args:
@@ -427,7 +513,7 @@ def scan_file_worker(args):
         dict: Scan result including matches, metadata, and warnings.
     """
     path, config = args
-    result = {
+    result: Dict[str, Any] = {
         "status": "OK",
         "path": path,
         "matches": [],
@@ -450,48 +536,87 @@ def scan_file_worker(args):
     # Extension Filter: Check against fast scan list or skip list
     ext = os.path.splitext(path)[1].lower()
     if config['fast']:
-        if ext not in FAST_SCAN_EXTS: return result
+        if ext not in FAST_SCAN_EXTS:
+            return result
     else:
-        if ext in DEFAULT_SKIP_EXTS: return result
+        if ext in DEFAULT_SKIP_EXTS:
+            return result
+
+    file_data: Optional[bytes] = None
+    mm: Optional[mmap.mmap] = None
+    size = 0
 
     try:
         with open(path, 'rb') as f:
             try:
                 stat = os.fstat(f.fileno())
-            except OSError: return result
+            except OSError:
+                return result
 
             size = stat.st_size
-            if size == 0: return result
+            if size == 0:
+                return result
+
             # Enforce size limit (prevents processing 50GB logs)
-            if size > (config['max_size'] * 1024 * 1024):
+            max_size_bytes = config['max_size'] * 1024 * 1024
+            if size > max_size_bytes:
                 result['warnings'].append(("WARN", "DISK_SKIP", "SIZE_LIMIT", path))
                 return result
-            
+
+            # Performance: Use memory-mapped I/O for large files (reduces memory pressure)
+            use_mmap = size > MMAP_THRESHOLD_BYTES
+
             try:
-                file_data = f.read()
-            except OSError as e:
+                if use_mmap:
+                    try:
+                        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                        scan_data = mm
+                    except (mmap.error, OSError):
+                        # Fallback to regular read if mmap fails (e.g., special files)
+                        file_data = f.read()
+                        scan_data = file_data
+                else:
+                    file_data = f.read()
+                    scan_data = file_data
+            except OSError:
                 # Reduced noise for IO errors (common in live systems)
                 return result
 
+        # Lazy hash calculation - only compute when needed
+        f_hash: Optional[str] = None
+
+        def get_hash() -> Optional[str]:
+            nonlocal f_hash
+            if f_hash is None:
+                f_hash = get_buffer_hash(bytes(scan_data))
+            return f_hash
+
         # Known Good Hash Check (if enabled)
-        f_hash = None
         if WORKER_HASHES:
-            f_hash = get_buffer_hash(file_data)
-            if f_hash and f_hash in WORKER_HASHES:
-                # Explicitly delete data before returning to free memory
-                del file_data
-                return result 
+            computed_hash = get_hash()
+            if computed_hash and computed_hash in WORKER_HASHES:
+                # Clean up and return early
+                if mm:
+                    mm.close()
+                elif file_data:
+                    del file_data
+                return result
 
         # Perform Scan using the pre-loaded global rules
         result['scanned'] = True
-        matches = WORKER_RULES.match(data=file_data, timeout=config['timeout'], fast=config['fast'])
-        
+        matches = WORKER_RULES.match(data=scan_data, timeout=config['timeout'], fast=config['fast'])
+
         if matches:
-            if not f_hash: f_hash = get_buffer_hash(file_data)
-            meta = {"sha256": f_hash or "HASH_FAILED", "size": size}
-            
+            computed_hash = get_hash()
+
             for m in matches:
-                strs = []
+                # FIX 2.1: Create FRESH meta dict for each match (prevents shared reference bug)
+                match_meta: Dict[str, Any] = {
+                    "sha256": computed_hash or "HASH_FAILED",
+                    "size": size
+                }
+
+                strs: List[Dict[str, Any]] = []
                 try:
                     for s in m.strings:
                         for instance in s.instances:
@@ -499,87 +624,113 @@ def scan_file_worker(args):
                             try:
                                 full_decoded = data_raw.decode('utf-8', errors='ignore')
                                 preview_display = full_decoded[:50].strip()
-                            except:
+                            except (UnicodeDecodeError, AttributeError):
                                 hex_val = data_raw.hex()
                                 full_decoded = f"HEX:{hex_val}"
                                 preview_display = f"HEX:{hex_val[:50]}"
-                                
-                            strs.append({"id": s.identifier, "offset": instance.offset, "data_preview": preview_display, "data_full": full_decoded})
-                except Exception:
-                    result['warnings'].append(("WARN", "YARA_INTERNAL", "STRING_EXTRACT_ERR", path))
-                
+
+                            strs.append({
+                                "id": s.identifier,
+                                "offset": instance.offset,
+                                "data_preview": preview_display,
+                                "data_full": full_decoded
+                            })
+                except Exception as e:
+                    result['warnings'].append(("WARN", "YARA_INTERNAL", "STRING_EXTRACT_ERR", f"{path}: {type(e).__name__}"))
+
                 # Optimization: Only extract IOCs if strings exist
                 if strs:
                     iocs = extract_iocs(strs)
-                    if iocs: meta['iocs'] = iocs
+                    if iocs:
+                        match_meta['iocs'] = iocs
 
                 result['matches'].append({
                     "rule": m.rule,
                     "namespace": m.namespace,
-                    "meta": meta,
+                    "meta": match_meta,
                     "strings": strs
                 })
-        
-        # Immediate cleanup: Delete file data to prevent memory bloating in the worker process
-        del file_data
-        
+
+        # Cleanup: Close mmap or delete file data
+        if mm:
+            mm.close()
+        elif file_data:
+            del file_data
+
         # Force Garbage Collection for large files to avoid OOM scenarios in long-running workers
-        if size > 50 * 1024 * 1024: 
+        if size > GC_THRESHOLD_BYTES:
             gc.collect()
 
-    except Exception:
+    except PermissionError:
+        # Common on Windows for locked files - don't log to reduce noise
         pass
+    except Exception as e:
+        # Log unexpected errors for debugging
+        result['warnings'].append(("WARN", "SCAN_ERROR", str(type(e).__name__), f"{path}: {str(e)[:100]}"))
 
     return result
 
 # --- LOGGER ---
 
 class DualLogger:
-    """ 
-    Handles logging to both Console (Stdout), JSONL (File), and HTML (Report). 
+    """
+    Handles logging to both Console (Stdout), JSONL (File), and HTML (Report).
     Also tracks statistics for the summary.
     """
-    def __init__(self, out_dir, cmd_args):
+    def __init__(self, out_dir: str, cmd_args: List[str]):
         self.hostname = platform.node()
         self.start_time_obj = time.time()
         self.start_str = time.strftime("%Y-%m-%d %H:%M:%S")
         ts_file = time.strftime("%Y%m%d_%H%M%S")
-        
+
         json_name = f"scan_{self.hostname}_{ts_file}.jsonl"
         html_name = f"scan_{self.hostname}_{ts_file}.html"
-        
+
         json_path = os.path.join(out_dir, json_name)
         html_path = os.path.join(out_dir, html_name)
-        
+
         print(f"[*] Log File: {json_name}")
-        
-        self.json_file = open(json_path, 'a', encoding='utf-8')
-        self.html_file = open(html_path, 'w', encoding='utf-8')
-        self.html_file.write(HTML_HEADER)
-        
-        self.cmd_args_raw = " ".join(cmd_args)
-        self.stats = {'rules': 0, 'scanned': 0, 'hits': 0, 'suspicious': 0, 'errors': 0}
-        self.ext_hits = defaultdict(int)
-        self.rule_hit_counts = {} 
-        self.noisy_rules = [] 
-        self.phase_times = {} 
+
+        # FIX 2.7: Prevent file handle leak if second open() fails
+        self.json_file: Optional[Any] = None
+        self.html_file: Optional[Any] = None
+        try:
+            self.json_file = open(json_path, 'a', encoding='utf-8')
+            self.html_file = open(html_path, 'w', encoding='utf-8')
+            self.html_file.write(HTML_HEADER)
+        except Exception:
+            # Clean up json_file if html_file open failed
+            if self.json_file:
+                self.json_file.close()
+            raise
+
+        # FIX 1.5: Sanitize command line args to prevent potential XSS in HTML report
+        # Replace angle brackets that could be interpreted as HTML tags
+        self.cmd_args_raw = " ".join(cmd_args).replace('<', '&lt;').replace('>', '&gt;')
+        self.stats: Dict[str, int] = {'rules': 0, 'scanned': 0, 'hits': 0, 'suspicious': 0, 'errors': 0}
+        self.ext_hits: Dict[str, int] = defaultdict(int)
+        self.rule_hit_counts: Dict[str, int] = {}
+        self.noisy_rules: List[str] = []
+        self.phase_times: Dict[str, Dict[str, Optional[float]]] = {} 
     
-    def start_phase(self, name):
+    def start_phase(self, name: str) -> None:
         """ Marks the start time of a scan phase (e.g. 'Memory', 'Disk'). """
         self.phase_times[name] = {"start": time.time(), "end": None}
-    
-    def end_phase(self, name):
+
+    def end_phase(self, name: str) -> None:
         """ Marks the end time of a scan phase. """
         if name in self.phase_times:
             self.phase_times[name]["end"] = time.time()
 
-    def set_rule_count(self, count):
+    def set_rule_count(self, count: int) -> None:
         self.stats['rules'] = count
 
-    def increment_scanned(self, count=1):
+    def increment_scanned(self, count: int = 1) -> None:
         self.stats['scanned'] += count
 
-    def log(self, level, scan_type, rule_name, target, meta=None, strings=None, source_file=None):
+    def log(self, level: str, scan_type: str, rule_name: Optional[str], target: str,
+            meta: Optional[Dict[str, Any]] = None, strings: Optional[List[Dict[str, Any]]] = None,
+            source_file: Optional[str] = None) -> None:
         """
         Main logging function.
         - Writes JSON object to file.
@@ -655,7 +806,7 @@ class DualLogger:
             row = f"""<div class="row"><span class="timestamp">{ts}</span><span class="{html_class}">{prefix}</span><span class="meta">[{scan_type}]</span>{source_display}<b>{safe_rule}</b> : {safe_target}</div>"""
             self.html_file.write(row)
 
-    def close(self):
+    def close(self) -> None:
         """ Closes files and appends final statistics (JS) to the HTML report. """
         end_time_obj = time.time()
         duration = end_time_obj - self.start_time_obj
@@ -706,16 +857,16 @@ class DualLogger:
         self.html_file.close()
         self.json_file.close()
 
-def compile_rules_to_file(rule_dir, logger):
+def compile_rules_to_file(rule_dir: str, logger: DualLogger) -> Tuple[Any, str, int]:
     """
     Compiles all .yar/.yara files in directory into a single binary.
     Preserves namespaces (filenames) for attribution.
     Saves to a temporary file for easy loading by workers.
     """
     print(f"[*] Compiling rules from: {rule_dir}")
-    sources = {}
+    sources: Dict[str, str] = {}
     valid_count = 0
-    
+
     for root, _, files in os.walk(rule_dir):
         for file in files:
             if file.endswith(('.yar', '.yara')):
@@ -747,12 +898,13 @@ def compile_rules_to_file(rule_dir, logger):
         print(f"[*] Rules compiled: {valid_count}. Saved to temp.")
         return compiled_rules, temp_path, valid_count
     except Exception as e:
-        logger.log("HIT", "CRITICAL_FAILURE", "LINKER_ERROR", str(e))
+        # FIX 2.8: Use WARN level for errors, not HIT (errors are not detections)
+        logger.log("WARN", "CRITICAL_FAILURE", "LINKER_ERROR", str(e))
         sys.exit(1)
 
-def extract_strings_modern(match_object):
+def extract_strings_modern(match_object: Any) -> List[Dict[str, Any]]:
     """ Helper to safely extract string matches from YARA object and decode them. """
-    results = []
+    results: List[Dict[str, Any]] = []
     try:
         for string_match in match_object.strings:
             try:
@@ -762,28 +914,96 @@ def extract_strings_modern(match_object):
                     try:
                         full_decoded = data_raw.decode('utf-8', errors='ignore').strip()
                         preview_display = full_decoded[:50].strip() if full_decoded else f"HEX:{data_raw.hex()[:50]}"
-                    except:
+                    except (UnicodeDecodeError, AttributeError):
                         full_decoded = f"HEX:{data_raw.hex()}"
                         preview_display = f"HEX:{data_raw.hex()[:50]}"
-                    results.append({"id": identifier, "offset": instance.offset, "data_preview": preview_display, "data_full": full_decoded})
-            except: pass
-    except: pass
+                    results.append({
+                        "id": identifier,
+                        "offset": instance.offset,
+                        "data_preview": preview_display,
+                        "data_full": full_decoded
+                    })
+            except (AttributeError, TypeError):
+                pass
+    except (AttributeError, TypeError):
+        pass
     return results
 
-def get_proc_name(proc):
-    try: return proc.name()
-    except: return "Unknown"
+
+def get_proc_name(proc: psutil.Process) -> str:
+    try:
+        return proc.name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return "Unknown"
+
+
+def fast_walk(top: str, current_os: str) -> Generator[Tuple[str, List[str], List[str]], None, None]:
+    """
+    Faster alternative to os.walk() using os.scandir().
+    Yields (dirpath, dirnames, filenames) tuples like os.walk().
+
+    Performance: os.scandir() returns DirEntry objects with cached stat info,
+    avoiding redundant stat() calls that os.walk() makes.
+
+    Args:
+        top: Root directory to traverse
+        current_os: Platform string for exclusion checks (cached for performance)
+    """
+    try:
+        dirs: List[str] = []
+        files: List[str] = []
+
+        with os.scandir(top) as scanner:
+            for entry in scanner:
+                try:
+                    # Use entry.is_dir/is_file with follow_symlinks=False for speed
+                    # This avoids following symlinks and uses cached stat info
+                    if entry.is_dir(follow_symlinks=False):
+                        # Skip excluded system directories
+                        if not should_exclude_path(entry.path, current_os):
+                            dirs.append(entry.name)
+                    elif entry.is_file(follow_symlinks=False):
+                        files.append(entry.name)
+                    # Symlinks to files are skipped (handled separately in worker)
+                except (OSError, PermissionError):
+                    # Skip entries we can't access
+                    pass
+
+        yield top, dirs, files
+
+        # Recurse into subdirectories
+        for d in dirs:
+            subdir = os.path.join(top, d)
+            yield from fast_walk(subdir, current_os)
+
+    except (OSError, PermissionError):
+        # Can't access this directory, skip it
+        pass
+
+
+def is_subpath_of_any(path: str, path_set: Set[str]) -> bool:
+    """
+    Check if path is a subpath of any path in the set.
+    Used for smarter Phase 2 deduplication (4.1).
+    """
+    path_normalized = os.path.normcase(path)
+    for processed in path_set:
+        # Check if path starts with any processed directory
+        if path_normalized.startswith(processed + os.sep) or path_normalized == processed:
+            return True
+    return False
+
 
 # --- MAIN ENTRY POINT ---
-def main():
+def main() -> None:
     if not is_admin():
         print(f"[CRITICAL] This tool requires Administrator/Root privileges.")
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description="Mass YARA Scanner", formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(description="Mass YARA Scanner v52", formatter_class=argparse.RawTextHelpFormatter)
     input_group = parser.add_argument_group('Input')
     input_group.add_argument('-r', '--rules', required=True, metavar='DIR', help="Directory containing .yara rule files")
-    
+
     target_group = parser.add_argument_group('Target')
     target_group.add_argument('-p', '--path', metavar='DIR', help="Scan a directory or file on disk")
     target_group.add_argument('-m', '--memory', action='store_true', help="Scan memory (Linux/Windows only)")
@@ -795,13 +1015,18 @@ def main():
     opt_group.add_argument('--known-good', metavar='FILE', help="SHA256 hash list to IGNORE")
     opt_group.add_argument('--max-size', type=validate_positive_int, default=DEFAULT_MAX_SIZE_MB, metavar='MB', help=f"Max file size MB (Default: {DEFAULT_MAX_SIZE_MB})")
     opt_group.add_argument('--max-mem', type=validate_positive_int, default=DEFAULT_MAX_MEM_MB, metavar='MB', help=f"Max Process RAM MB (Default: {DEFAULT_MAX_MEM_MB})")
+    # FIX 3.6: Make chunk size configurable for tuning
+    opt_group.add_argument('--chunk-size', type=validate_positive_int, default=0, metavar='N',
+                           help="Worker chunk size (0=auto, Default: auto)")
 
     out_group = parser.add_argument_group('Output')
     out_group.add_argument('-o', '--out-dir', default=".", metavar='DIR', help="Output directory")
 
     args = parser.parse_args()
-    if not args.path and not args.memory: parser.error("You must specify at least one target.")
-    if not os.path.exists(args.out_dir): os.makedirs(args.out_dir)
+    if not args.path and not args.memory:
+        parser.error("You must specify at least one target.")
+    if not os.path.exists(args.out_dir):
+        os.makedirs(args.out_dir)
 
     if args.low_priority:
         set_low_priority()
@@ -895,60 +1120,61 @@ def main():
             # This ensures os.walk yields absolute paths, so we don't need
             # to call abspath() inside the tight loop below.
             args.path = os.path.abspath(args.path)
-            
+
             print(f"[*] Scanning Disk: {args.path}")
-            
+
+            # FIX 3.1: Cache platform.system() once instead of calling in every loop iteration
+            current_os = platform.system()
+
             # Wrapper for safety and logic encapsulation
-            def safe_file_generator():
-                """ 
+            def safe_file_generator() -> Generator[Tuple[str, Dict[str, Any]], None, None]:
+                """
                 Generates file paths for workers, handling priorities and deduplication.
                 Prevents infinite loops by tracking 'processed_dirs'.
+                Uses fast_walk() with os.scandir() for better performance.
                 """
                 try:
-                    processed_dirs = set()
+                    processed_dirs: Set[str] = set()
                     priority_list = get_priority_paths(args.path)
-                    
+
                     # PHASE 1: Priority Drop Zones
                     # Scan likely malware locations first to get quick wins
                     if priority_list:
-                        print(f"[*] Phase 1: Scanning {len(priority_list)} Priority Targets...")
+                        print(f"[*] Phase 1: Scanning {len(priority_list)} Priority Targets (sorted by likelihood)...")
                         for p_root in priority_list:
                             # Normalize paths once for performance
                             norm_p_root = os.path.normcase(os.path.abspath(p_root))
                             processed_dirs.add(norm_p_root)
-                            
-                            for root, dirs, files in os.walk(p_root):
-                                # Optimization: root is already absolute because p_root is absolute
-                                norm_root = os.path.normcase(root)
-                                
-                                # Filter symlinks and restricted directories
-                                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d)) and not should_exclude_path(os.path.join(root, d), platform.system())]
-                                
+
+                            # FIX 3.4: Use fast_walk with os.scandir() for better performance
+                            for root, dirs, files in fast_walk(p_root, current_os):
+                                # FIX 3.3: Cache join results to avoid redundant calls
                                 for file in files:
                                     full_path = os.path.join(root, file)
                                     if is_safe_path(full_path, args.path):
                                         yield (full_path, worker_config)
-                    
+
                     # PHASE 2: General Scan
                     # Scan whatever is left, skipping what we already covered in Phase 1
                     print(f"[*] Phase 2: Scanning remaining files in {args.path}...")
-                    for root, dirs, files in os.walk(args.path):
-                        # Optimization: args.path was forced absolute above, so root is absolute.
-                        # We can skip os.path.abspath() here for speed.
+
+                    # FIX 3.4: Use fast_walk with os.scandir() for better performance
+                    for root, dirs, files in fast_walk(args.path, current_os):
                         norm_root = os.path.normcase(root)
-                        
-                        # Optimization: Prune the tree if we already scanned this folder in Phase 1
-                        if norm_root in processed_dirs:
-                            dirs[:] = []
+
+                        # FIX 4.1: Smarter deduplication - skip if this path or any parent was in Phase 1
+                        if is_subpath_of_any(norm_root, processed_dirs):
                             continue
-                        
-                        dirs[:] = [
-                            d for d in dirs 
-                            if not os.path.islink(os.path.join(root, d))
-                            and os.path.normcase(os.path.join(root, d)) not in processed_dirs
-                            and not should_exclude_path(os.path.join(root, d), platform.system())
-                        ]
-                        
+
+                        # FIX 3.3: Cache join results and filter in single pass
+                        filtered_dirs = []
+                        for d in dirs:
+                            full_d = os.path.join(root, d)
+                            norm_d = os.path.normcase(full_d)
+                            if norm_d not in processed_dirs and not is_subpath_of_any(norm_d, processed_dirs):
+                                filtered_dirs.append(d)
+                        dirs[:] = filtered_dirs
+
                         for file in files:
                             full_path = os.path.join(root, file)
                             if is_safe_path(full_path, args.path):
@@ -961,56 +1187,74 @@ def main():
             # This ensures all workers are actually ready (rules loaded) before we feed them files.
             manager = multiprocessing.Manager()
             status_queue = manager.Queue()
-            
+
             print(f"[*] Initializing {args.workers} workers...")
-            
+
             PROG_FMT = "\r[*] Progress: {} files processed..."
 
             # Start the Worker Pool
-            with multiprocessing.Pool(processes=args.workers, initializer=init_worker, initargs=(temp_rules_path, args.known_good, status_queue)) as pool:
-                
-                # Check for "OK" messages from all workers
-                active_workers = 0
-                for _ in range(args.workers):
+            try:
+                with multiprocessing.Pool(processes=args.workers, initializer=init_worker, initargs=(temp_rules_path, args.known_good, status_queue)) as pool:
+
+                    # FIX 2.3: Scale timeout with rule count for large rule sets
+                    # Base 30s + 10ms per rule (5000 rules = 80s timeout)
+                    init_timeout = max(WORKER_INIT_BASE_TIMEOUT, WORKER_INIT_BASE_TIMEOUT + (rule_count * WORKER_INIT_TIMEOUT_PER_RULE))
+                    print(f"[*] Worker init timeout: {init_timeout:.1f}s (scaled for {rule_count} rules)")
+
+                    # Check for "OK" messages from all workers
+                    active_workers = 0
+                    for _ in range(args.workers):
+                        try:
+                            msg = status_queue.get(timeout=init_timeout)
+                            if msg == "OK":
+                                active_workers += 1
+                            else:
+                                print(f"[!] Worker Init Failed: {msg}")
+                        except Exception:
+                            print(f"[!] Worker Init Timeout (>{init_timeout:.1f}s)")
+
+                    if active_workers < args.workers:
+                        print(f"[CRITICAL] Only {active_workers}/{args.workers} started. Aborting to prevent deadlock.")
+                        return
+
+                    # FIX 3.6: Use configurable or auto-calculated chunk size
+                    if args.chunk_size > 0:
+                        chunk_size = args.chunk_size
+                    else:
+                        chunk_size = max(50, args.workers * DEFAULT_CHUNK_MULTIPLIER)
+                    print(f"[*] Using chunk size: {chunk_size}")
+
+                    logger.start_phase("Disk")
+
                     try:
-                        msg = status_queue.get(timeout=10) # Wait 10s for init
-                        if msg == "OK":
-                            active_workers += 1
-                        else:
-                            print(f"[!] Worker Init Failed: {msg}")
-                    except:
-                        print(f"[!] Worker Init Timeout")
-                
-                if active_workers < args.workers:
-                    print(f"[CRITICAL] Only {active_workers}/{args.workers} started. Aborting to prevent deadlock.")
-                    return
+                        total_files_processed = 0
+                        # Use imap_unordered for better performance (we don't care about file order)
+                        for result in pool.imap_unordered(scan_file_worker, safe_file_generator(), chunksize=chunk_size):
 
-                chunk_size = max(20, args.workers * 5)
-                logger.start_phase("Disk")
-                
+                            total_files_processed += 1
+                            if total_files_processed % PROGRESS_INTERVAL == 0:
+                                sys.stdout.write(PROG_FMT.format(total_files_processed))
+                                sys.stdout.flush()
+
+                            if result['scanned']:
+                                logger.increment_scanned()
+
+                            for m in result['matches']:
+                                logger.log("HIT", "DISK", m['rule'], result['path'], meta=m['meta'], strings=m['strings'], source_file=m['namespace'])
+
+                            for w in result['warnings']:
+                                logger.log(w[0], w[1], None, w[3], meta={"msg": w[2]})
+
+                    except KeyboardInterrupt:
+                        print(f"\n[!] Caught Interrupt. Stopping Workers...")
+
+                    logger.end_phase("Disk")
+            finally:
+                # FIX 2.6: Properly shutdown the Manager to prevent zombie processes
                 try:
-                    total_files_processed = 0
-                    # Use imap_unordered for better performance (we don't care about file order)
-                    for result in pool.imap_unordered(scan_file_worker, safe_file_generator(), chunksize=chunk_size):
-                        
-                        total_files_processed += 1
-                        if total_files_processed % PROGRESS_INTERVAL == 0:
-                            sys.stdout.write(PROG_FMT.format(total_files_processed))
-                            sys.stdout.flush()
-
-                        if result['scanned']:
-                            logger.increment_scanned()
-                        
-                        for m in result['matches']:
-                            logger.log("HIT", "DISK", m['rule'], result['path'], meta=m['meta'], strings=m['strings'], source_file=m['namespace'])
-                        
-                        for w in result['warnings']:
-                            logger.log(w[0], w[1], None, w[3], meta={"msg": w[2]})
-                            
-                except KeyboardInterrupt:
-                    print(f"\n[!] Caught Interrupt. Stopping Workers...")
-                
-                logger.end_phase("Disk")
+                    manager.shutdown()
+                except Exception:
+                    pass
     
     finally:
         # Cleanup temp rule file
